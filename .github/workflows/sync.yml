@@ -20,15 +20,96 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          token: ${{ steps.generate-token.outputs.token }}
-
-      - name: Sync branches and tags from upstream
+      - name: Check whether sync is needed
+        id: check
+        env:
+          TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
+          set -euo pipefail
+          # Mirror policy: master, release/*, and all tags. Branches we
+          # explicitly created in the fork (orphan branches with no shared
+          # history with master, e.g. the workflow-config branch) are kept.
+          # Any other branch on origin is upstream cruft to prune.
+          UPSTREAM_URL=https://github.com/espressif/esp-idf.git
+          ORIGIN_URL="https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          PATTERNS=('refs/heads/master' 'refs/heads/release/*' 'refs/tags/*')
+          UPSTREAM=$(git ls-remote "$UPSTREAM_URL" "${PATTERNS[@]}" | sort)
+          ORIGIN=$(git ls-remote "$ORIGIN_URL" "${PATTERNS[@]}" | sort)
+          # Use upstream-existence as a cheap proxy for "upstream-derived" in
+          # the pre-flight check. The sync step verifies via merge-base before
+          # actually deleting anything, so this only needs to be approximate.
+          if ! UPSTREAM_HEADS=$(git ls-remote --heads "$UPSTREAM_URL"); then
+            echo "::error::Failed to list upstream branches"
+            exit 1
+          fi
+          if ! ORIGIN_HEADS=$(git ls-remote --heads "$ORIGIN_URL"); then
+            echo "::error::Failed to list origin branches"
+            exit 1
+          fi
+          UPSTREAM_REFS=$(echo "$UPSTREAM_HEADS" | awk '{print $2}' | sort -u)
+          CRUFT=""
+          while IFS= read -r line; do
+            ref="${line##*$'\t'}"
+            case "$ref" in
+              refs/heads/master|refs/heads/release/*) continue ;;
+              refs/heads/*)
+                if grep -qFx "$ref" <<< "$UPSTREAM_REFS"; then
+                  CRUFT+="${ref}"$'\n'
+                fi
+                ;;
+            esac
+          done <<< "$ORIGIN_HEADS"
+          CRUFT="${CRUFT%$'\n'}"
+          if [ "$UPSTREAM" = "$ORIGIN" ] && [ -z "$CRUFT" ]; then
+            echo "in_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Already in sync; nothing to do."
+          else
+            echo "in_sync=false" >> "$GITHUB_OUTPUT"
+            [ -n "$CRUFT" ] && { echo "Likely upstream-derived branches to prune:"; echo "$CRUFT"; }
+            echo "Sync needed."
+          fi
+
+      - name: Sync from upstream and prune
+        if: steps.check.outputs.in_sync != 'true'
+        env:
+          TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          ORIGIN_URL="https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          # Bare clone gives us every origin branch as a local ref, which we
+          # need below for the merge-base check against master.
+          git clone --bare "$ORIGIN_URL" repo.git
+          cd repo.git
           git remote add upstream https://github.com/espressif/esp-idf.git
-          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/*' --force
-          git push origin '+refs/remotes/upstream/*:refs/heads/*' '+refs/tags/*:refs/tags/*' --force
+          git fetch upstream \
+            '+refs/heads/master:refs/heads/master' \
+            '+refs/heads/release/*:refs/heads/release/*' \
+            '+refs/tags/*:refs/tags/*' --force
+          git push origin \
+            '+refs/heads/master:refs/heads/master' \
+            '+refs/heads/release/*:refs/heads/release/*' \
+            '+refs/tags/*:refs/tags/*' --force
+          # Authoritative cleanup: a non-policy branch is upstream-derived
+          # iff it shares any history with master. Branches with a disjoint
+          # commit tree were created in this fork (e.g. the workflow
+          # configuration branch) and stay.
+          if ! ORIGIN_HEADS=$(git ls-remote --heads origin); then
+            echo "::error::Failed to list origin branches for prune"
+            exit 1
+          fi
+          while IFS= read -r line; do
+            ref="${line##*$'\t'}"
+            case "$ref" in
+              refs/heads/master|refs/heads/release/*) continue ;;
+              refs/heads/*) ;;
+              *) continue ;;
+            esac
+            branch="${ref#refs/heads/}"
+            if git merge-base "$ref" refs/heads/master >/dev/null 2>&1; then
+              echo "Pruning upstream-derived branch: $branch"
+              git push origin --delete "$branch"
+            else
+              echo "Keeping fork-specific branch (disjoint history): $branch"
+            fi
+          done <<< "$ORIGIN_HEADS"
           echo "✅ Sync complete"
