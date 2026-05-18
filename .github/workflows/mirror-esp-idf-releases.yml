@@ -82,11 +82,7 @@ jobs:
           echo "Releases to mirror: $COUNT"
           echo "$PENDING" | jq -r '.[]'
 
-          if [ "$COUNT" -eq 0 ]; then
-            MATRIX='{"include":[{"tag":"__none__"}]}'
-          else
-            MATRIX=$(jq -n --argjson p "$PENDING" '{include: [$p[] | {tag: .}]}')
-          fi
+          MATRIX=$(jq -n --argjson p "$PENDING" '{include: [$p[] | {tag: .}]}')
 
           {
             echo "matrix<<MATRIX_EOF"
@@ -97,7 +93,7 @@ jobs:
   # 2. For each pending release: strip .git and republish
   mirror:
     needs: discover
-    if: ${{ !contains(needs.discover.outputs.matrix, '__none__') }}
+    if: ${{ fromJson(needs.discover.outputs.matrix).include[0] != null }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -128,6 +124,7 @@ jobs:
           echo "$DATA" | jq -r '.body // ""' > "$GITHUB_WORKSPACE/release_body.md"
 
       - name: Download, strip .git, repack
+        id: repack
         env:
           ASSET_URL:  ${{ steps.meta.outputs.asset_url }}
           ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
@@ -155,16 +152,16 @@ jobs:
           zip -qr "${BASE}.zip" "${EXTRACTED_DIR}"
 
           echo "==> Repacking as tar.gz…"
-          tar czf "${BASE}.tar.gz" "${EXTRACTED_DIR}"
+          tar -I 'pigz -9' -cf "${BASE}.tar.gz" "${EXTRACTED_DIR}"
 
           echo "==> Repacking as tar.xz…"
-          tar cJf "${BASE}.tar.xz" "${EXTRACTED_DIR}"
+          tar -I 'xz -T0 -9' -cf "${BASE}.tar.xz" "${EXTRACTED_DIR}"
 
           echo "==> Sizes:"
           ls -lh "${BASE}.zip" "${BASE}.tar.gz" "${BASE}.tar.xz"
 
-          echo "BASE=${BASE}"  >> "$GITHUB_ENV"
-          echo "WORK_DIR=$PWD" >> "$GITHUB_ENV"
+          echo "base=${BASE}"   >> "$GITHUB_OUTPUT"
+          echo "work_dir=$PWD"  >> "$GITHUB_OUTPUT"
 
       - name: Publish mirrored release
         env:
@@ -172,6 +169,8 @@ jobs:
           TAG:          ${{ matrix.tag }}
           RELEASE_NAME: ${{ steps.meta.outputs.release_name }}
           PRERELEASE:   ${{ steps.meta.outputs.prerelease }}
+          BASE:         ${{ steps.repack.outputs.base }}
+          WORK_DIR:     ${{ steps.repack.outputs.work_dir }}
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
@@ -179,24 +178,41 @@ jobs:
           printf '> Mirrored from [espressif/esp-idf@%s](https://github.com/espressif/esp-idf/releases/tag/%s). `.git` directory removed.\n\n---\n\n' \
             "$TAG" "$TAG" | cat - "$GITHUB_WORKSPACE/release_body.md" > "$GITHUB_WORKSPACE/full_body.md"
 
-          # Delete existing release + tag in this repo (idempotent)
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
-          gh api --method DELETE "/repos/${{ github.repository }}/git/refs/tags/${TAG}" 2>/dev/null || true
-
-          # Point new tag at the default branch HEAD
-          SHA=$(gh api "/repos/${{ github.repository }}/git/ref/heads/$(gh api "/repos/${{ github.repository }}" --jq '.default_branch')" --jq '.object.sha')
-          gh api --method POST "/repos/${{ github.repository }}/git/refs" \
-            -f "ref=refs/tags/${TAG}" -f "sha=${SHA}"
-
           PRERELEASE_FLAG=""
           [ "$PRERELEASE" = "true" ] && PRERELEASE_FLAG="--prerelease"
 
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "${RELEASE_NAME:-$TAG}" \
-            --notes-file "$GITHUB_WORKSPACE/full_body.md" \
-            $PRERELEASE_FLAG \
-            "${BASE}.zip" "${BASE}.tar.gz" "${BASE}.tar.xz"
+          # Asset names match upstream's (BASE derived from upstream's .zip name),
+          # so re-runs hit the same filenames and `--clobber` replaces them in place.
+          # The release itself, its notes/title, and the tag are preserved.
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; updating notes and clobbering assets"
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "${RELEASE_NAME:-$TAG}" \
+              --notes-file "$GITHUB_WORKSPACE/full_body.md" \
+              $PRERELEASE_FLAG
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              --clobber \
+              "${BASE}.zip" "${BASE}.tar.gz" "${BASE}.tar.xz"
+          else
+            # First-time mirror for this tag. If the tag itself is missing too
+            # (sync.yml hasn't picked it up yet), anchor the new tag at the
+            # default branch — sync.yml will overwrite it to the upstream
+            # commit on its next run.
+            TARGET_ARG=()
+            if ! gh api "/repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} not present in mirror; release will create it at default branch"
+              TARGET_ARG=(--target "${{ github.event.repository.default_branch }}")
+            fi
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "${RELEASE_NAME:-$TAG}" \
+              --notes-file "$GITHUB_WORKSPACE/full_body.md" \
+              $PRERELEASE_FLAG \
+              "${TARGET_ARG[@]}" \
+              "${BASE}.zip" "${BASE}.tar.gz" "${BASE}.tar.xz"
+          fi
 
           echo "✅ Mirrored $TAG"
 
